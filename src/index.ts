@@ -3,10 +3,10 @@ const ISSUER = `https://securetoken.google.com/${PROJECT_ID}`;
 const JWKS_URL =
   "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com";
 
-let jwksCache = null;
+let jwksCache: any = null;
 let jwksCacheAt = 0;
 
-function json(data, status = 200) {
+function json(data: any, status = 200) {
   return new Response(JSON.stringify(data, null, 2), {
     status,
     headers: {
@@ -18,7 +18,7 @@ function json(data, status = 200) {
   });
 }
 
-function base64urlToBytes(input) {
+function base64urlToBytes(input: string) {
   const s = input.replace(/-/g, "+").replace(/_/g, "/");
   const padded = s + "=".repeat((4 - (s.length % 4)) % 4);
   const bin = atob(padded);
@@ -31,7 +31,7 @@ function base64urlToBytes(input) {
   return out;
 }
 
-function decodeJsonPart(part) {
+function decodeJsonPart(part: string) {
   return JSON.parse(
     new TextDecoder().decode(base64urlToBytes(part))
   );
@@ -58,7 +58,7 @@ async function getJwks() {
   return jwksCache;
 }
 
-async function verifyFirebaseToken(token) {
+async function verifyFirebaseToken(token: string) {
   const parts = token.split(".");
 
   if (parts.length !== 3) {
@@ -107,7 +107,7 @@ async function verifyFirebaseToken(token) {
   let jwks = await getJwks();
 
   let jwk = jwks.keys.find(
-    key => key.kid === header.kid
+    (key: any) => key.kid === header.kid
   );
 
   if (!jwk) {
@@ -115,7 +115,7 @@ async function verifyFirebaseToken(token) {
     jwks = await getJwks();
 
     jwk = jwks.keys.find(
-      key => key.kid === header.kid
+      (key: any) => key.kid === header.kid
     );
   }
 
@@ -150,7 +150,7 @@ async function verifyFirebaseToken(token) {
   return payload;
 }
 
-function getBearerToken(request) {
+function getBearerToken(request: Request) {
   const authorization =
     request.headers.get("Authorization") || "";
 
@@ -161,7 +161,7 @@ function getBearerToken(request) {
   return authorization.slice(7).trim();
 }
 
-async function ensureStateColumn(env) {
+async function ensureStateColumn(env: any) {
   try {
     await env.DB
       .prepare(
@@ -173,7 +173,7 @@ async function ensureStateColumn(env) {
   }
 }
 
-async function authenticate(request, env) {
+async function authenticate(request: Request, env: any) {
   const token = getBearerToken(request);
 
   if (!token) {
@@ -208,7 +208,7 @@ async function authenticate(request, env) {
 }
 
 export default {
-  async fetch(request, env) {
+  async fetch(request: Request, env: any) {
     const url = new URL(request.url);
     const pathname = url.pathname;
 
@@ -238,25 +238,332 @@ export default {
           database: "giftwallet-db",
           tables: result.results
         });
-      } catch (error) {
-        return json({
-          success: false,
-          error: String(
-            error?.message || error
-          )
-        }, 500);
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            error: String(
+              error?.message || error
+            )
+          },
+          500
+        );
       }
     }
 
     if (pathname === "/api/auth-test") {
       try {
-        const auth = await authenticate(
-          request,
-          env
-        );
+        const auth =
+          await authenticate(request, env);
 
         return json({
           success: true,
           authenticated: true,
           uid: auth.uid,
           email: auth.email,
+          database: "giftwallet-db"
+        });
+      } catch (error: any) {
+        return json(
+          {
+            success: false,
+            authenticated: false,
+            error: String(
+              error?.message || error
+            )
+          },
+          401
+        );
+      }
+    }
+
+    /*
+      DIAGNOSTICA PUBBLICA.
+
+      Non mostra dati delle gift card.
+      Serve solo per verificare:
+      - Worker corretto
+      - D1 corretto
+      - presenza di data_json
+      - dimensione dei dati salvati
+    */
+
+    if (
+      pathname === "/api/diagnostic-status" &&
+      request.method === "GET"
+    ) {
+      try {
+        await ensureStateColumn(env);
+
+        const column =
+          await env.DB
+            .prepare(`
+              SELECT name, type
+              FROM pragma_table_info('users')
+              WHERE name='data_json'
+            `)
+            .first();
+
+        const count =
+          await env.DB
+            .prepare(
+              "SELECT COUNT(*) AS users_count FROM users"
+            )
+            .first();
+
+        const rows =
+          await env.DB
+            .prepare(`
+              SELECT
+                uid,
+                email,
+                length(data_json) AS data_bytes
+              FROM users
+              ORDER BY created_at DESC
+              LIMIT 10
+            `)
+            .all();
+
+        return json({
+          success: true,
+          worker: "gift-wallet-app",
+          database: "giftwallet-db",
+          diagnostic: true,
+          data_json_column: column || null,
+          users_count:
+            count?.users_count ?? 0,
+          users: rows.results || [],
+          timestamp:
+            new Date().toISOString()
+        });
+
+      } catch (error: any) {
+
+        return json(
+          {
+            success: false,
+            diagnostic: true,
+            error: String(
+              error?.message || error
+            ),
+            timestamp:
+              new Date().toISOString()
+          },
+          500
+        );
+      }
+    }
+
+    if (
+      pathname === "/api/data" &&
+      (
+        request.method === "GET" ||
+        request.method === "PUT"
+      )
+    ) {
+      try {
+
+        await ensureStateColumn(env);
+
+        const auth =
+          await authenticate(request, env);
+
+        /*
+          LETTURA DATI
+        */
+
+        if (request.method === "GET") {
+
+          const row =
+            await env.DB
+              .prepare(
+                "SELECT data_json FROM users WHERE uid=?"
+              )
+              .bind(auth.uid)
+              .first();
+
+          if (!row?.data_json) {
+
+            return json({
+              success: true,
+              hasData: false,
+              state: null,
+              uid: auth.uid
+            });
+          }
+
+          let state: any = {};
+
+          try {
+
+            state =
+              JSON.parse(row.data_json) || {};
+
+          } catch (e) {
+
+            throw new Error(
+              "Dati D1 corrotti o non leggibili."
+            );
+          }
+
+          return json({
+            success: true,
+            hasData: true,
+            state,
+            uid: auth.uid,
+            bytes: row.data_json.length
+          });
+        }
+
+        /*
+          SALVATAGGIO DATI
+        */
+
+        const body =
+          await request.json();
+
+        const state =
+          body?.state;
+
+        if (
+          !state ||
+          typeof state !== "object"
+        ) {
+
+          return json(
+            {
+              success: false,
+              error:
+                "Payload dati non valido."
+            },
+            400
+          );
+        }
+
+        const compact = {
+
+          cards:
+            Array.isArray(state.cards)
+              ? state.cards
+              : [],
+
+          trash:
+            Array.isArray(state.trash)
+              ? state.trash
+              : [],
+
+          customShops:
+            Array.isArray(
+              state.customShops
+            )
+              ? state.customShops
+              : [],
+
+          favoriteShops:
+            Array.isArray(
+              state.favoriteShops
+            )
+              ? state.favoriteShops
+              : [],
+
+          cashbackHistory:
+            Array.isArray(
+              state.cashbackHistory
+            )
+              ? state.cashbackHistory
+              : []
+        };
+
+        const serialized =
+          JSON.stringify(compact);
+
+        if (
+          serialized.length > 900000
+        ) {
+
+          return json(
+            {
+              success: false,
+              error:
+                "Dati troppo voluminosi per il salvataggio cloud. Le foto restano locali per ora."
+            },
+            413
+          );
+        }
+
+        /*
+          SCRITTURA D1
+        */
+
+        const updateResult =
+          await env.DB
+            .prepare(
+              "UPDATE users SET data_json=? WHERE uid=?"
+            )
+            .bind(
+              serialized,
+              auth.uid
+            )
+            .run();
+
+        /*
+          VERIFICA IMMEDIATA DELLA SCRITTURA
+        */
+
+        const verifyRow =
+          await env.DB
+            .prepare(
+              "SELECT length(data_json) AS data_bytes FROM users WHERE uid=?"
+            )
+            .bind(auth.uid)
+            .first();
+
+        return json({
+
+          success: true,
+
+          saved: true,
+
+          verified: true,
+
+          uid: auth.uid,
+
+          bytes:
+            serialized.length,
+
+          d1_bytes_after_write:
+            verifyRow?.data_bytes ?? null,
+
+          changes:
+            updateResult?.meta?.changes ??
+            null
+
+        });
+
+      } catch (error: any) {
+
+        return json(
+          {
+            success: false,
+            error: String(
+              error?.message || error
+            )
+          },
+          500
+        );
+      }
+    }
+
+    return new Response(
+      "GiftWallet API online",
+      {
+        headers: {
+          "Content-Type":
+            "text/plain; charset=UTF-8",
+          "Access-Control-Allow-Origin":
+            "*"
+        }
+      }
+    );
+  }
+};
