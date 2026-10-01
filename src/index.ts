@@ -32,32 +32,18 @@ function decodeJsonPart(part) {
 
 async function getJwks() {
   const now = Date.now();
-
-  if (jwksCache && now - jwksCacheAt < 3600000) {
-    return jwksCache;
-  }
-
+  if (jwksCache && now - jwksCacheAt < 3600000) return jwksCache;
   const response = await fetch(JWKS_URL);
-
-  if (!response.ok) {
-    throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
-  }
-
+  if (!response.ok) throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
   jwksCache = await response.json();
   jwksCacheAt = now;
-
   return jwksCache;
 }
 
 async function verifyFirebaseToken(token) {
   const parts = token.split(".");
-
-  if (parts.length !== 3) {
-    throw new Error("Token Firebase non valido.");
-  }
-
+  if (parts.length !== 3) throw new Error("Token Firebase non valido.");
   const [encodedHeader, encodedPayload, encodedSignature] = parts;
-
   const header = decodeJsonPart(encodedHeader);
   const payload = decodeJsonPart(encodedPayload);
 
@@ -75,11 +61,7 @@ async function verifyFirebaseToken(token) {
 
   const now = Math.floor(Date.now() / 1000);
 
-  if (
-    !payload.sub ||
-    typeof payload.sub !== "string" ||
-    payload.sub.length > 128
-  ) {
+  if (!payload.sub || typeof payload.sub !== "string" || payload.sub.length > 128) {
     throw new Error("UID Firebase non valido.");
   }
 
@@ -92,7 +74,6 @@ async function verifyFirebaseToken(token) {
   }
 
   let jwks = await getJwks();
-
   let jwk = jwks.keys.find(key => key.kid === header.kid);
 
   if (!jwk) {
@@ -158,229 +139,19 @@ async function authenticate(request, env) {
   }
 
   const claims = await verifyFirebaseToken(token);
-
   const uid = claims.sub;
-  const email =
-    typeof claims.email === "string"
-      ? claims.email
-      : null;
+  const email = typeof claims.email === "string" ? claims.email : null;
 
   await env.DB.prepare(`
     INSERT INTO users (uid, email)
     VALUES (?, ?)
     ON CONFLICT(uid) DO UPDATE SET email = excluded.email
-  `)
-    .bind(uid, email)
-    .run();
+  `).bind(uid, email).run();
 
   return {
     uid,
     email
   };
-}
-
-function getSafeImageExtension(contentType) {
-  const type = String(contentType || "").toLowerCase();
-
-  if (type.includes("jpeg") || type.includes("jpg")) {
-    return "jpg";
-  }
-
-  if (type.includes("png")) {
-    return "png";
-  }
-
-  if (type.includes("webp")) {
-    return "webp";
-  }
-
-  if (type.includes("gif")) {
-    return "gif";
-  }
-
-  return "bin";
-}
-
-function makeImageKey(uid, extension) {
-  return `users/${uid}/images/${crypto.randomUUID()}.${extension}`;
-}
-
-async function saveImageToR2(request, env, auth) {
-  if (!env.IMAGES) {
-    return json(
-      {
-        success: false,
-        error: "Binding R2 IMAGES non configurato nel Worker."
-      },
-      500
-    );
-  }
-
-  const contentType =
-    request.headers.get("Content-Type") ||
-    "application/octet-stream";
-
-  const contentLength =
-    Number(request.headers.get("Content-Length") || 0);
-
-  /*
-   * Limite prudenziale per singola immagine:
-   * 15 MB.
-   */
-  if (contentLength > 15 * 1024 * 1024) {
-    return json(
-      {
-        success: false,
-        error: "Immagine troppo grande. Limite 15 MB."
-      },
-      413
-    );
-  }
-
-  const extension = getSafeImageExtension(contentType);
-
-  const key = makeImageKey(auth.uid, extension);
-
-  const arrayBuffer = await request.arrayBuffer();
-
-  if (arrayBuffer.byteLength > 15 * 1024 * 1024) {
-    return json(
-      {
-        success: false,
-        error: "Immagine troppo grande. Limite 15 MB."
-      },
-      413
-    );
-  }
-
-  await env.IMAGES.put(key, arrayBuffer, {
-    httpMetadata: {
-      contentType
-    },
-    customMetadata: {
-      uid: auth.uid
-    }
-  });
-
-  return json({
-    success: true,
-    saved: true,
-    key,
-    bytes: arrayBuffer.byteLength,
-    contentType
-  });
-}
-
-async function readImageFromR2(request, env, auth) {
-  if (!env.IMAGES) {
-    return json(
-      {
-        success: false,
-        error: "Binding R2 IMAGES non configurato nel Worker."
-      },
-      500
-    );
-  }
-
-  const url = new URL(request.url);
-  const key = url.searchParams.get("key");
-
-  if (!key) {
-    return json(
-      {
-        success: false,
-        error: "Parametro key mancante."
-      },
-      400
-    );
-  }
-
-  /*
-   * Sicurezza:
-   * l'utente può leggere solo immagini appartenenti
-   * alla propria cartella R2.
-   */
-  const expectedPrefix = `users/${auth.uid}/`;
-
-  if (!key.startsWith(expectedPrefix)) {
-    return json(
-      {
-        success: false,
-        error: "Accesso all'immagine non autorizzato."
-      },
-      403
-    );
-  }
-
-  const object = await env.IMAGES.get(key);
-
-  if (!object) {
-    return json(
-      {
-        success: false,
-        error: "Immagine non trovata."
-      },
-      404
-    );
-  }
-
-  const headers = new Headers();
-
-  object.writeHttpMetadata(headers);
-
-  headers.set("etag", object.httpEtag);
-  headers.set("Access-Control-Allow-Origin", "*");
-  headers.set("Cache-Control", "private, max-age=3600");
-
-  return new Response(object.body, {
-    status: 200,
-    headers
-  });
-}
-
-async function deleteImageFromR2(request, env, auth) {
-  if (!env.IMAGES) {
-    return json(
-      {
-        success: false,
-        error: "Binding R2 IMAGES non configurato nel Worker."
-      },
-      500
-    );
-  }
-
-  const url = new URL(request.url);
-  const key = url.searchParams.get("key");
-
-  if (!key) {
-    return json(
-      {
-        success: false,
-        error: "Parametro key mancante."
-      },
-      400
-    );
-  }
-
-  const expectedPrefix = `users/${auth.uid}/`;
-
-  if (!key.startsWith(expectedPrefix)) {
-    return json(
-      {
-        success: false,
-        error: "Eliminazione non autorizzata."
-      },
-      403
-    );
-  }
-
-  await env.IMAGES.delete(key);
-
-  return json({
-    success: true,
-    deleted: true,
-    key
-  });
 }
 
 export default {
@@ -393,10 +164,8 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers":
-            "Authorization, Content-Type",
-          "Access-Control-Allow-Methods":
-            "GET, PUT, POST, DELETE, OPTIONS"
+          "Access-Control-Allow-Headers": "Authorization, Content-Type",
+          "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS"
         }
       });
     }
@@ -413,13 +182,10 @@ export default {
           tables: result.results
         });
       } catch (error) {
-        return json(
-          {
-            success: false,
-            error: String(error?.message || error)
-          },
-          500
-        );
+        return json({
+          success: false,
+          error: String(error?.message || error)
+        }, 500);
       }
     }
 
@@ -432,18 +198,14 @@ export default {
           authenticated: true,
           uid: auth.uid,
           email: auth.email,
-          database: "giftwallet-db",
-          r2: !!env.IMAGES
+          database: "giftwallet-db"
         });
       } catch (error) {
-        return json(
-          {
-            success: false,
-            authenticated: false,
-            error: String(error?.message || error)
-          },
-          401
-        );
+        return json({
+          success: false,
+          authenticated: false,
+          error: String(error?.message || error)
+        }, 401);
       }
     }
 
@@ -454,56 +216,44 @@ export default {
       try {
         await ensureStateColumn(env);
 
-        const column = await env.DB.prepare(
-          `SELECT name, type
-           FROM pragma_table_info('users')
-           WHERE name='data_json'`
-        ).first();
+        const column = await env.DB.prepare(`
+          SELECT name, type
+          FROM pragma_table_info('users')
+          WHERE name='data_json'
+        `).first();
 
         const count = await env.DB.prepare(
           "SELECT COUNT(*) AS users_count FROM users"
         ).first();
 
-        const rows = await env.DB.prepare(
-          `SELECT uid, email, length(data_json) AS data_bytes
-           FROM users
-           ORDER BY created_at DESC
-           LIMIT 10`
-        ).all();
+        const rows = await env.DB.prepare(`
+          SELECT uid, email, length(data_json) AS data_bytes
+          FROM users
+          ORDER BY created_at DESC
+          LIMIT 10
+        `).all();
 
         return json({
           success: true,
           worker: "gift-wallet-app",
           database: "giftwallet-db",
-          r2_binding: !!env.IMAGES,
-          r2_bucket: "giftwallet-images",
           diagnostic: true,
           data_json_column: column || null,
           users_count: count?.users_count ?? 0,
           users: rows.results || [],
           timestamp: new Date().toISOString()
         });
+
       } catch (error) {
-        return json(
-          {
-            success: false,
-            diagnostic: true,
-            error: String(error?.message || error),
-            timestamp: new Date().toISOString()
-          },
-          500
-        );
+        return json({
+          success: false,
+          diagnostic: true,
+          error: String(error?.message || error),
+          timestamp: new Date().toISOString()
+        }, 500);
       }
     }
 
-    /*
-     * R2 - UPLOAD IMMAGINE
-     *
-     * POST /api/image
-     *
-     * Il body della richiesta deve essere direttamente
-     * il file immagine.
-     */
     if (
       pathname === "/api/image" &&
       request.method === "POST"
@@ -511,27 +261,81 @@ export default {
       try {
         const auth = await authenticate(request, env);
 
-        return await saveImageToR2(
-          request,
-          env,
-          auth
-        );
-      } catch (error) {
-        return json(
-          {
+        if (!env.IMAGES) {
+          return json({
             success: false,
-            error: String(error?.message || error)
-          },
-          500
+            error: "Binding R2 IMAGES non configurato."
+          }, 500);
+        }
+
+        const form = await request.formData();
+        const file = form.get("file");
+
+        if (!(file instanceof File)) {
+          return json({
+            success: false,
+            error: "File mancante."
+          }, 400);
+        }
+
+        if (file.size > 15 * 1024 * 1024) {
+          return json({
+            success: false,
+            error: "File troppo grande. Limite 15 MB."
+          }, 413);
+        }
+
+        const allowed = new Set([
+          "image/jpeg",
+          "image/png",
+          "image/webp",
+          "image/gif",
+          "application/pdf"
+        ]);
+
+        if (!allowed.has(file.type)) {
+          return json({
+            success: false,
+            error: "Tipo file non consentito."
+          }, 415);
+        }
+
+        const safeName = String(
+          file.name || "giftwallet-file"
+        )
+          .replace(/[^a-zA-Z0-9._-]/g, "_")
+          .slice(0, 180);
+
+        const key =
+          `users/${auth.uid}/images/${crypto.randomUUID()}-${safeName}`;
+
+        await env.IMAGES.put(
+          key,
+          file.stream(),
+          {
+            httpMetadata: {
+              contentType: file.type
+            }
+          }
         );
+
+        return json({
+          success: true,
+          uploaded: true,
+          key,
+          fileName: file.name,
+          contentType: file.type,
+          size: file.size
+        });
+
+      } catch (error) {
+        return json({
+          success: false,
+          error: String(error?.message || error)
+        }, 500);
       }
     }
 
-    /*
-     * R2 - LETTURA IMMAGINE
-     *
-     * GET /api/image?key=...
-     */
     if (
       pathname === "/api/image" &&
       request.method === "GET"
@@ -539,27 +343,53 @@ export default {
       try {
         const auth = await authenticate(request, env);
 
-        return await readImageFromR2(
-          request,
-          env,
-          auth
+        if (!env.IMAGES) {
+          return new Response(
+            "R2 non configurato",
+            { status: 500 }
+          );
+        }
+
+        const key = url.searchParams.get("key") || "";
+
+        if (!key.startsWith(`users/${auth.uid}/`)) {
+          return new Response(
+            "Forbidden",
+            { status: 403 }
+          );
+        }
+
+        const object = await env.IMAGES.get(key);
+
+        if (!object) {
+          return new Response(
+            "Not found",
+            { status: 404 }
+          );
+        }
+
+        const headers = new Headers();
+
+        object.writeHttpMetadata(headers);
+        headers.set("etag", object.httpEtag);
+        headers.set(
+          "Cache-Control",
+          "private, max-age=3600"
         );
+
+        return new Response(
+          object.body,
+          { headers }
+        );
+
       } catch (error) {
-        return json(
-          {
-            success: false,
-            error: String(error?.message || error)
-          },
-          500
+        return new Response(
+          String(error?.message || error),
+          { status: 500 }
         );
       }
     }
 
-    /*
-     * R2 - ELIMINAZIONE IMMAGINE
-     *
-     * DELETE /api/image?key=...
-     */
     if (
       pathname === "/api/image" &&
       request.method === "DELETE"
@@ -567,29 +397,41 @@ export default {
       try {
         const auth = await authenticate(request, env);
 
-        return await deleteImageFromR2(
-          request,
-          env,
-          auth
-        );
-      } catch (error) {
-        return json(
-          {
+        if (!env.IMAGES) {
+          return json({
             success: false,
-            error: String(error?.message || error)
-          },
-          500
-        );
+            error: "Binding R2 IMAGES non configurato."
+          }, 500);
+        }
+
+        const key = url.searchParams.get("key") || "";
+
+        if (!key.startsWith(`users/${auth.uid}/`)) {
+          return json({
+            success: false,
+            error: "Accesso negato."
+          }, 403);
+        }
+
+        await env.IMAGES.delete(key);
+
+        return json({
+          success: true,
+          deleted: true,
+          key
+        });
+
+      } catch (error) {
+        return json({
+          success: false,
+          error: String(error?.message || error)
+        }, 500);
       }
     }
 
-    /*
-     * D1 - DATI GIFTWALLET
-     */
     if (
       pathname === "/api/data" &&
-      (request.method === "GET" ||
-        request.method === "PUT")
+      (request.method === "GET" || request.method === "PUT")
     ) {
       try {
         await ensureStateColumn(env);
@@ -597,6 +439,7 @@ export default {
         const auth = await authenticate(request, env);
 
         if (request.method === "GET") {
+
           const row = await env.DB.prepare(
             "SELECT data_json FROM users WHERE uid=?"
           )
@@ -632,17 +475,13 @@ export default {
         }
 
         const body = await request.json();
-
         const state = body?.state;
 
         if (!state || typeof state !== "object") {
-          return json(
-            {
-              success: false,
-              error: "Payload dati non valido."
-            },
-            400
-          );
+          return json({
+            success: false,
+            error: "Payload dati non valido."
+          }, 400);
         }
 
         const compact = {
@@ -662,42 +501,49 @@ export default {
             ? state.favoriteShops
             : [],
 
-          cashbackHistory: Array.isArray(
-            state.cashbackHistory
-          )
+          cashbackHistory: Array.isArray(state.cashbackHistory)
             ? state.cashbackHistory
             : []
         };
 
         const serialized = JSON.stringify(compact);
 
-        /*
-         * D1 può contenere i dati dell'app.
-         * Le immagini, nella prossima fase,
-         * verranno invece spostate in R2.
-         */
-        if (serialized.length > 10000000) {
-          return json(
-            {
-              success: false,
-              error:
-                "Dati troppo voluminosi per il salvataggio cloud. Limite massimo 10 MB."
-            },
-            413
-          );
+        if (serialized.length > 900000) {
+          return json({
+            success: false,
+            error:
+              "Dati troppo voluminosi per il salvataggio cloud. Le foto restano locali per ora."
+          }, 413);
         }
 
-        const updateResult = await env.DB.prepare(
-          "UPDATE users SET data_json=? WHERE uid=?"
-        )
-          .bind(serialized, auth.uid)
+        const upsertResult = await env.DB.prepare(`
+          INSERT INTO users (uid, email, data_json)
+          VALUES (?, ?, ?)
+          ON CONFLICT(uid) DO UPDATE SET
+            email = excluded.email,
+            data_json = excluded.data_json
+        `)
+          .bind(
+            auth.uid,
+            auth.email,
+            serialized
+          )
           .run();
 
         const verifyRow = await env.DB.prepare(
-          "SELECT length(data_json) AS data_bytes FROM users WHERE uid=?"
+          "SELECT uid, email, length(data_json) AS data_bytes FROM users WHERE uid=?"
         )
           .bind(auth.uid)
           .first();
+
+        if (
+          !verifyRow ||
+          verifyRow.data_bytes !== serialized.length
+        ) {
+          throw new Error(
+            "D1 non ha confermato il salvataggio dei dati della Gift Card."
+          );
+        }
 
         return json({
           success: true,
@@ -708,16 +554,14 @@ export default {
           d1_bytes_after_write:
             verifyRow?.data_bytes ?? null,
           changes:
-            updateResult?.meta?.changes ?? null
+            upsertResult?.meta?.changes ?? null
         });
+
       } catch (error) {
-        return json(
-          {
-            success: false,
-            error: String(error?.message || error)
-          },
-          500
-        );
+        return json({
+          success: false,
+          error: String(error?.message || error)
+        }, 500);
       }
     }
 
@@ -725,8 +569,7 @@ export default {
       "GiftWallet API online",
       {
         headers: {
-          "Content-Type":
-            "text/plain; charset=UTF-8",
+          "Content-Type": "text/plain; charset=UTF-8",
           "Access-Control-Allow-Origin": "*"
         }
       }
