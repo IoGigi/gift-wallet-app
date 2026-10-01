@@ -33,17 +33,28 @@ function decodeJsonPart(part) {
 async function getJwks() {
   const now = Date.now();
   if (jwksCache && now - jwksCacheAt < 3600000) return jwksCache;
+
   const response = await fetch(JWKS_URL);
-  if (!response.ok) throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
+
+  if (!response.ok) {
+    throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
+  }
+
   jwksCache = await response.json();
   jwksCacheAt = now;
+
   return jwksCache;
 }
 
 async function verifyFirebaseToken(token) {
   const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("Token Firebase non valido.");
+
+  if (parts.length !== 3) {
+    throw new Error("Token Firebase non valido.");
+  }
+
   const [encodedHeader, encodedPayload, encodedSignature] = parts;
+
   const header = decodeJsonPart(encodedHeader);
   const payload = decodeJsonPart(encodedPayload);
 
@@ -61,7 +72,11 @@ async function verifyFirebaseToken(token) {
 
   const now = Math.floor(Date.now() / 1000);
 
-  if (!payload.sub || typeof payload.sub !== "string" || payload.sub.length > 128) {
+  if (
+    !payload.sub ||
+    typeof payload.sub !== "string" ||
+    payload.sub.length > 128
+  ) {
     throw new Error("UID Firebase non valido.");
   }
 
@@ -74,12 +89,18 @@ async function verifyFirebaseToken(token) {
   }
 
   let jwks = await getJwks();
-  let jwk = jwks.keys.find(key => key.kid === header.kid);
+
+  let jwk = jwks.keys.find(
+    key => key.kid === header.kid
+  );
 
   if (!jwk) {
     jwksCache = null;
     jwks = await getJwks();
-    jwk = jwks.keys.find(key => key.kid === header.kid);
+
+    jwk = jwks.keys.find(
+      key => key.kid === header.kid
+    );
   }
 
   if (!jwk) {
@@ -101,7 +122,9 @@ async function verifyFirebaseToken(token) {
     "RSASSA-PKCS1-v1_5",
     cryptoKey,
     base64urlToBytes(encodedSignature),
-    new TextEncoder().encode(`${encodedHeader}.${encodedPayload}`)
+    new TextEncoder().encode(
+      `${encodedHeader}.${encodedPayload}`
+    )
   );
 
   if (!valid) {
@@ -112,7 +135,8 @@ async function verifyFirebaseToken(token) {
 }
 
 function getBearerToken(request) {
-  const authorization = request.headers.get("Authorization") || "";
+  const authorization =
+    request.headers.get("Authorization") || "";
 
   if (!authorization.startsWith("Bearer ")) {
     return null;
@@ -135,18 +159,28 @@ async function authenticate(request, env) {
   const token = getBearerToken(request);
 
   if (!token) {
-    throw new Error("Manca Authorization: Bearer <Firebase ID token>.");
+    throw new Error(
+      "Manca Authorization: Bearer <Firebase ID token>."
+    );
   }
 
   const claims = await verifyFirebaseToken(token);
+
   const uid = claims.sub;
-  const email = typeof claims.email === "string" ? claims.email : null;
+
+  const email =
+    typeof claims.email === "string"
+      ? claims.email
+      : null;
 
   await env.DB.prepare(`
     INSERT INTO users (uid, email)
     VALUES (?, ?)
-    ON CONFLICT(uid) DO UPDATE SET email = excluded.email
-  `).bind(uid, email).run();
+    ON CONFLICT(uid) DO UPDATE SET
+      email = excluded.email
+  `)
+    .bind(uid, email)
+    .run();
 
   return {
     uid,
@@ -164,8 +198,10 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type",
-          "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS"
+          "Access-Control-Allow-Headers":
+            "Authorization, Content-Type",
+          "Access-Control-Allow-Methods":
+            "GET, PUT, POST, DELETE, OPTIONS"
         }
       });
     }
@@ -191,7 +227,10 @@ export default {
 
     if (pathname === "/api/auth-test") {
       try {
-        const auth = await authenticate(request, env);
+        const auth = await authenticate(
+          request,
+          env
+        );
 
         return json({
           success: true,
@@ -227,7 +266,10 @@ export default {
         ).first();
 
         const rows = await env.DB.prepare(`
-          SELECT uid, email, length(data_json) AS data_bytes
+          SELECT
+            uid,
+            email,
+            length(data_json) AS data_bytes
           FROM users
           ORDER BY created_at DESC
           LIMIT 10
@@ -259,16 +301,22 @@ export default {
       request.method === "POST"
     ) {
       try {
-        const auth = await authenticate(request, env);
+        const auth = await authenticate(
+          request,
+          env
+        );
 
         if (!env.IMAGES) {
           return json({
             success: false,
-            error: "Binding R2 IMAGES non configurato."
+            error:
+              "Binding R2 IMAGES non configurato."
           }, 500);
         }
 
-        const form = await request.formData();
+        const form =
+          await request.formData();
+
         const file = form.get("file");
 
         if (!(file instanceof File)) {
@@ -281,7 +329,8 @@ export default {
         if (file.size > 15 * 1024 * 1024) {
           return json({
             success: false,
-            error: "File troppo grande. Limite 15 MB."
+            error:
+              "File troppo grande. Limite 15 MB."
           }, 413);
         }
 
@@ -296,14 +345,18 @@ export default {
         if (!allowed.has(file.type)) {
           return json({
             success: false,
-            error: "Tipo file non consentito."
+            error:
+              "Tipo file non consentito."
           }, 415);
         }
 
         const safeName = String(
           file.name || "giftwallet-file"
         )
-          .replace(/[^a-zA-Z0-9._-]/g, "_")
+          .replace(
+            /[^a-zA-Z0-9._-]/g,
+            "_"
+          )
           .slice(0, 180);
 
         const key =
@@ -341,7 +394,8 @@ export default {
       request.method === "GET"
     ) {
       try {
-        const auth = await authenticate(request, env);
+        const auth =
+          await authenticate(request, env);
 
         if (!env.IMAGES) {
           return new Response(
@@ -350,16 +404,22 @@ export default {
           );
         }
 
-        const key = url.searchParams.get("key") || "";
+        const key =
+          url.searchParams.get("key") || "";
 
-        if (!key.startsWith(`users/${auth.uid}/`)) {
+        if (
+          !key.startsWith(
+            `users/${auth.uid}/`
+          )
+        ) {
           return new Response(
             "Forbidden",
             { status: 403 }
           );
         }
 
-        const object = await env.IMAGES.get(key);
+        const object =
+          await env.IMAGES.get(key);
 
         if (!object) {
           return new Response(
@@ -371,7 +431,12 @@ export default {
         const headers = new Headers();
 
         object.writeHttpMetadata(headers);
-        headers.set("etag", object.httpEtag);
+
+        headers.set(
+          "etag",
+          object.httpEtag
+        );
+
         headers.set(
           "Cache-Control",
           "private, max-age=3600"
@@ -395,18 +460,25 @@ export default {
       request.method === "DELETE"
     ) {
       try {
-        const auth = await authenticate(request, env);
+        const auth =
+          await authenticate(request, env);
 
         if (!env.IMAGES) {
           return json({
             success: false,
-            error: "Binding R2 IMAGES non configurato."
+            error:
+              "Binding R2 IMAGES non configurato."
           }, 500);
         }
 
-        const key = url.searchParams.get("key") || "";
+        const key =
+          url.searchParams.get("key") || "";
 
-        if (!key.startsWith(`users/${auth.uid}/`)) {
+        if (
+          !key.startsWith(
+            `users/${auth.uid}/`
+          )
+        ) {
           return json({
             success: false,
             error: "Accesso negato."
@@ -431,20 +503,25 @@ export default {
 
     if (
       pathname === "/api/data" &&
-      (request.method === "GET" || request.method === "PUT")
+      (
+        request.method === "GET" ||
+        request.method === "PUT"
+      )
     ) {
       try {
         await ensureStateColumn(env);
 
-        const auth = await authenticate(request, env);
+        const auth =
+          await authenticate(request, env);
 
         if (request.method === "GET") {
 
-          const row = await env.DB.prepare(
-            "SELECT data_json FROM users WHERE uid=?"
-          )
-            .bind(auth.uid)
-            .first();
+          const row =
+            await env.DB.prepare(
+              "SELECT data_json FROM users WHERE uid=?"
+            )
+              .bind(auth.uid)
+              .first();
 
           if (!row?.data_json) {
             return json({
@@ -458,7 +535,8 @@ export default {
           let state = {};
 
           try {
-            state = JSON.parse(row.data_json) || {};
+            state =
+              JSON.parse(row.data_json) || {};
           } catch (e) {
             throw new Error(
               "Dati D1 corrotti o non leggibili."
@@ -474,39 +552,53 @@ export default {
           });
         }
 
-        const body = await request.json();
+        const body =
+          await request.json();
+
         const state = body?.state;
 
-        if (!state || typeof state !== "object") {
+        if (
+          !state ||
+          typeof state !== "object"
+        ) {
           return json({
             success: false,
-            error: "Payload dati non valido."
+            error:
+              "Payload dati non valido."
           }, 400);
         }
 
         const compact = {
-          cards: Array.isArray(state.cards)
-            ? state.cards
-            : [],
+          cards:
+            Array.isArray(state.cards)
+              ? state.cards
+              : [],
 
-          trash: Array.isArray(state.trash)
-            ? state.trash
-            : [],
+          trash:
+            Array.isArray(state.trash)
+              ? state.trash
+              : [],
 
-          customShops: Array.isArray(state.customShops)
-            ? state.customShops
-            : [],
+          customShops:
+            Array.isArray(state.customShops)
+              ? state.customShops
+              : [],
 
-          favoriteShops: Array.isArray(state.favoriteShops)
-            ? state.favoriteShops
-            : [],
+          favoriteShops:
+            Array.isArray(state.favoriteShops)
+              ? state.favoriteShops
+              : [],
 
-          cashbackHistory: Array.isArray(state.cashbackHistory)
-            ? state.cashbackHistory
-            : []
+          cashbackHistory:
+            Array.isArray(
+              state.cashbackHistory
+            )
+              ? state.cashbackHistory
+              : []
         };
 
-        const serialized = JSON.stringify(compact);
+        const serialized =
+          JSON.stringify(compact);
 
         if (serialized.length > 900000) {
           return json({
@@ -516,29 +608,33 @@ export default {
           }, 413);
         }
 
-        const upsertResult = await env.DB.prepare(`
-          INSERT INTO users (uid, email, data_json)
-          VALUES (?, ?, ?)
-          ON CONFLICT(uid) DO UPDATE SET
-            email = excluded.email,
-            data_json = excluded.data_json
-        `)
-          .bind(
-            auth.uid,
-            auth.email,
-            serialized
-          )
-          .run();
+        const upsertResult =
+          await env.DB.prepare(`
+            INSERT INTO users
+              (uid, email, data_json)
+            VALUES (?, ?, ?)
+            ON CONFLICT(uid) DO UPDATE SET
+              email = excluded.email,
+              data_json = excluded.data_json
+          `)
+            .bind(
+              auth.uid,
+              auth.email,
+              serialized
+            )
+            .run();
 
-        const verifyRow = await env.DB.prepare(
-          "SELECT uid, email, length(data_json) AS data_bytes FROM users WHERE uid=?"
-        )
-          .bind(auth.uid)
-          .first();
+        const verifyRow =
+          await env.DB.prepare(
+            "SELECT uid, email, length(data_json) AS data_bytes FROM users WHERE uid=?"
+          )
+            .bind(auth.uid)
+            .first();
 
         if (
           !verifyRow ||
-          verifyRow.data_bytes !== serialized.length
+          verifyRow.data_bytes !==
+            serialized.length
         ) {
           throw new Error(
             "D1 non ha confermato il salvataggio dei dati della Gift Card."
@@ -560,7 +656,9 @@ export default {
       } catch (error) {
         return json({
           success: false,
-          error: String(error?.message || error)
+          error: String(
+            error?.message || error
+          )
         }, 500);
       }
     }
@@ -569,8 +667,10 @@ export default {
       "GiftWallet API online",
       {
         headers: {
-          "Content-Type": "text/plain; charset=UTF-8",
-          "Access-Control-Allow-Origin": "*"
+          "Content-Type":
+            "text/plain; charset=UTF-8",
+          "Access-Control-Allow-Origin":
+            "*"
         }
       }
     );
