@@ -12,7 +12,7 @@ function json(data, status = 200) {
       "Content-Type": "application/json; charset=UTF-8",
       "Access-Control-Allow-Origin": "*",
       "Access-Control-Allow-Headers": "Authorization, Content-Type",
-      "Access-Control-Allow-Methods": "GET, PUT, OPTIONS"
+      "Access-Control-Allow-Methods": "GET, PUT, POST, DELETE, OPTIONS"
     }
   });
 }
@@ -32,19 +32,32 @@ function decodeJsonPart(part) {
 
 async function getJwks() {
   const now = Date.now();
-  if (jwksCache && now - jwksCacheAt < 3600000) return jwksCache;
+
+  if (jwksCache && now - jwksCacheAt < 3600000) {
+    return jwksCache;
+  }
+
   const response = await fetch(JWKS_URL);
-  if (!response.ok) throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
+
+  if (!response.ok) {
+    throw new Error("Impossibile recuperare le chiavi pubbliche Firebase.");
+  }
+
   jwksCache = await response.json();
   jwksCacheAt = now;
+
   return jwksCache;
 }
 
 async function verifyFirebaseToken(token) {
   const parts = token.split(".");
-  if (parts.length !== 3) throw new Error("Token Firebase non valido.");
+
+  if (parts.length !== 3) {
+    throw new Error("Token Firebase non valido.");
+  }
 
   const [encodedHeader, encodedPayload, encodedSignature] = parts;
+
   const header = decodeJsonPart(encodedHeader);
   const payload = decodeJsonPart(encodedPayload);
 
@@ -62,7 +75,11 @@ async function verifyFirebaseToken(token) {
 
   const now = Math.floor(Date.now() / 1000);
 
-  if (!payload.sub || typeof payload.sub !== "string" || payload.sub.length > 128) {
+  if (
+    !payload.sub ||
+    typeof payload.sub !== "string" ||
+    payload.sub.length > 128
+  ) {
     throw new Error("UID Firebase non valido.");
   }
 
@@ -75,6 +92,7 @@ async function verifyFirebaseToken(token) {
   }
 
   let jwks = await getJwks();
+
   let jwk = jwks.keys.find(key => key.kid === header.kid);
 
   if (!jwk) {
@@ -114,13 +132,19 @@ async function verifyFirebaseToken(token) {
 
 function getBearerToken(request) {
   const authorization = request.headers.get("Authorization") || "";
-  if (!authorization.startsWith("Bearer ")) return null;
+
+  if (!authorization.startsWith("Bearer ")) {
+    return null;
+  }
+
   return authorization.slice(7).trim();
 }
 
 async function ensureStateColumn(env) {
   try {
-    await env.DB.prepare("ALTER TABLE users ADD COLUMN data_json TEXT").run();
+    await env.DB.prepare(
+      "ALTER TABLE users ADD COLUMN data_json TEXT"
+    ).run();
   } catch (e) {
     // La colonna esiste già.
   }
@@ -134,16 +158,229 @@ async function authenticate(request, env) {
   }
 
   const claims = await verifyFirebaseToken(token);
+
   const uid = claims.sub;
-  const email = typeof claims.email === "string" ? claims.email : null;
+  const email =
+    typeof claims.email === "string"
+      ? claims.email
+      : null;
 
   await env.DB.prepare(`
     INSERT INTO users (uid, email)
     VALUES (?, ?)
     ON CONFLICT(uid) DO UPDATE SET email = excluded.email
-  `).bind(uid, email).run();
+  `)
+    .bind(uid, email)
+    .run();
 
-  return { uid, email };
+  return {
+    uid,
+    email
+  };
+}
+
+function getSafeImageExtension(contentType) {
+  const type = String(contentType || "").toLowerCase();
+
+  if (type.includes("jpeg") || type.includes("jpg")) {
+    return "jpg";
+  }
+
+  if (type.includes("png")) {
+    return "png";
+  }
+
+  if (type.includes("webp")) {
+    return "webp";
+  }
+
+  if (type.includes("gif")) {
+    return "gif";
+  }
+
+  return "bin";
+}
+
+function makeImageKey(uid, extension) {
+  return `users/${uid}/images/${crypto.randomUUID()}.${extension}`;
+}
+
+async function saveImageToR2(request, env, auth) {
+  if (!env.IMAGES) {
+    return json(
+      {
+        success: false,
+        error: "Binding R2 IMAGES non configurato nel Worker."
+      },
+      500
+    );
+  }
+
+  const contentType =
+    request.headers.get("Content-Type") ||
+    "application/octet-stream";
+
+  const contentLength =
+    Number(request.headers.get("Content-Length") || 0);
+
+  /*
+   * Limite prudenziale per singola immagine:
+   * 15 MB.
+   */
+  if (contentLength > 15 * 1024 * 1024) {
+    return json(
+      {
+        success: false,
+        error: "Immagine troppo grande. Limite 15 MB."
+      },
+      413
+    );
+  }
+
+  const extension = getSafeImageExtension(contentType);
+
+  const key = makeImageKey(auth.uid, extension);
+
+  const arrayBuffer = await request.arrayBuffer();
+
+  if (arrayBuffer.byteLength > 15 * 1024 * 1024) {
+    return json(
+      {
+        success: false,
+        error: "Immagine troppo grande. Limite 15 MB."
+      },
+      413
+    );
+  }
+
+  await env.IMAGES.put(key, arrayBuffer, {
+    httpMetadata: {
+      contentType
+    },
+    customMetadata: {
+      uid: auth.uid
+    }
+  });
+
+  return json({
+    success: true,
+    saved: true,
+    key,
+    bytes: arrayBuffer.byteLength,
+    contentType
+  });
+}
+
+async function readImageFromR2(request, env, auth) {
+  if (!env.IMAGES) {
+    return json(
+      {
+        success: false,
+        error: "Binding R2 IMAGES non configurato nel Worker."
+      },
+      500
+    );
+  }
+
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key");
+
+  if (!key) {
+    return json(
+      {
+        success: false,
+        error: "Parametro key mancante."
+      },
+      400
+    );
+  }
+
+  /*
+   * Sicurezza:
+   * l'utente può leggere solo immagini appartenenti
+   * alla propria cartella R2.
+   */
+  const expectedPrefix = `users/${auth.uid}/`;
+
+  if (!key.startsWith(expectedPrefix)) {
+    return json(
+      {
+        success: false,
+        error: "Accesso all'immagine non autorizzato."
+      },
+      403
+    );
+  }
+
+  const object = await env.IMAGES.get(key);
+
+  if (!object) {
+    return json(
+      {
+        success: false,
+        error: "Immagine non trovata."
+      },
+      404
+    );
+  }
+
+  const headers = new Headers();
+
+  object.writeHttpMetadata(headers);
+
+  headers.set("etag", object.httpEtag);
+  headers.set("Access-Control-Allow-Origin", "*");
+  headers.set("Cache-Control", "private, max-age=3600");
+
+  return new Response(object.body, {
+    status: 200,
+    headers
+  });
+}
+
+async function deleteImageFromR2(request, env, auth) {
+  if (!env.IMAGES) {
+    return json(
+      {
+        success: false,
+        error: "Binding R2 IMAGES non configurato nel Worker."
+      },
+      500
+    );
+  }
+
+  const url = new URL(request.url);
+  const key = url.searchParams.get("key");
+
+  if (!key) {
+    return json(
+      {
+        success: false,
+        error: "Parametro key mancante."
+      },
+      400
+    );
+  }
+
+  const expectedPrefix = `users/${auth.uid}/`;
+
+  if (!key.startsWith(expectedPrefix)) {
+    return json(
+      {
+        success: false,
+        error: "Eliminazione non autorizzata."
+      },
+      403
+    );
+  }
+
+  await env.IMAGES.delete(key);
+
+  return json({
+    success: true,
+    deleted: true,
+    key
+  });
 }
 
 export default {
@@ -156,17 +393,19 @@ export default {
         status: 204,
         headers: {
           "Access-Control-Allow-Origin": "*",
-          "Access-Control-Allow-Headers": "Authorization, Content-Type",
-          "Access-Control-Allow-Methods": "GET, PUT, OPTIONS"
+          "Access-Control-Allow-Headers":
+            "Authorization, Content-Type",
+          "Access-Control-Allow-Methods":
+            "GET, PUT, POST, DELETE, OPTIONS"
         }
       });
     }
 
     if (pathname === "/api/db-test") {
       try {
-        const result = await env.DB
-          .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
-          .all();
+        const result = await env.DB.prepare(
+          "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        ).all();
 
         return json({
           success: true,
@@ -174,10 +413,13 @@ export default {
           tables: result.results
         });
       } catch (error) {
-        return json({
-          success: false,
-          error: String(error?.message || error)
-        }, 500);
+        return json(
+          {
+            success: false,
+            error: String(error?.message || error)
+          },
+          500
+        );
       }
     }
 
@@ -190,42 +432,51 @@ export default {
           authenticated: true,
           uid: auth.uid,
           email: auth.email,
-          database: "giftwallet-db"
+          database: "giftwallet-db",
+          r2: !!env.IMAGES
         });
       } catch (error) {
-        return json({
-          success: false,
-          authenticated: false,
-          error: String(error?.message || error)
-        }, 401);
+        return json(
+          {
+            success: false,
+            authenticated: false,
+            error: String(error?.message || error)
+          },
+          401
+        );
       }
     }
 
-    if (pathname === "/api/diagnostic-status" && request.method === "GET") {
+    if (
+      pathname === "/api/diagnostic-status" &&
+      request.method === "GET"
+    ) {
       try {
         await ensureStateColumn(env);
 
-        const column = await env.DB.prepare(`
-          SELECT name, type
-          FROM pragma_table_info('users')
-          WHERE name='data_json'
-        `).first();
+        const column = await env.DB.prepare(
+          `SELECT name, type
+           FROM pragma_table_info('users')
+           WHERE name='data_json'`
+        ).first();
 
-        const count = await env.DB
-          .prepare("SELECT COUNT(*) AS users_count FROM users")
-          .first();
+        const count = await env.DB.prepare(
+          "SELECT COUNT(*) AS users_count FROM users"
+        ).first();
 
-        const rows = await env.DB.prepare(`
-          SELECT uid, email, length(data_json) AS data_bytes
-          FROM users
-          ORDER BY created_at DESC
-          LIMIT 10
-        `).all();
+        const rows = await env.DB.prepare(
+          `SELECT uid, email, length(data_json) AS data_bytes
+           FROM users
+           ORDER BY created_at DESC
+           LIMIT 10`
+        ).all();
 
         return json({
           success: true,
           worker: "gift-wallet-app",
           database: "giftwallet-db",
+          r2_binding: !!env.IMAGES,
+          r2_bucket: "giftwallet-images",
           diagnostic: true,
           data_json_column: column || null,
           users_count: count?.users_count ?? 0,
@@ -233,24 +484,122 @@ export default {
           timestamp: new Date().toISOString()
         });
       } catch (error) {
-        return json({
-          success: false,
-          diagnostic: true,
-          error: String(error?.message || error),
-          timestamp: new Date().toISOString()
-        }, 500);
+        return json(
+          {
+            success: false,
+            diagnostic: true,
+            error: String(error?.message || error),
+            timestamp: new Date().toISOString()
+          },
+          500
+        );
       }
     }
 
-    if (pathname === "/api/data" && (request.method === "GET" || request.method === "PUT")) {
+    /*
+     * R2 - UPLOAD IMMAGINE
+     *
+     * POST /api/image
+     *
+     * Il body della richiesta deve essere direttamente
+     * il file immagine.
+     */
+    if (
+      pathname === "/api/image" &&
+      request.method === "POST"
+    ) {
+      try {
+        const auth = await authenticate(request, env);
+
+        return await saveImageToR2(
+          request,
+          env,
+          auth
+        );
+      } catch (error) {
+        return json(
+          {
+            success: false,
+            error: String(error?.message || error)
+          },
+          500
+        );
+      }
+    }
+
+    /*
+     * R2 - LETTURA IMMAGINE
+     *
+     * GET /api/image?key=...
+     */
+    if (
+      pathname === "/api/image" &&
+      request.method === "GET"
+    ) {
+      try {
+        const auth = await authenticate(request, env);
+
+        return await readImageFromR2(
+          request,
+          env,
+          auth
+        );
+      } catch (error) {
+        return json(
+          {
+            success: false,
+            error: String(error?.message || error)
+          },
+          500
+        );
+      }
+    }
+
+    /*
+     * R2 - ELIMINAZIONE IMMAGINE
+     *
+     * DELETE /api/image?key=...
+     */
+    if (
+      pathname === "/api/image" &&
+      request.method === "DELETE"
+    ) {
+      try {
+        const auth = await authenticate(request, env);
+
+        return await deleteImageFromR2(
+          request,
+          env,
+          auth
+        );
+      } catch (error) {
+        return json(
+          {
+            success: false,
+            error: String(error?.message || error)
+          },
+          500
+        );
+      }
+    }
+
+    /*
+     * D1 - DATI GIFTWALLET
+     */
+    if (
+      pathname === "/api/data" &&
+      (request.method === "GET" ||
+        request.method === "PUT")
+    ) {
       try {
         await ensureStateColumn(env);
 
         const auth = await authenticate(request, env);
 
         if (request.method === "GET") {
-          const row = await env.DB
-            .prepare("SELECT data_json FROM users WHERE uid=?")
+          const row = await env.DB.prepare(
+            "SELECT data_json FROM users WHERE uid=?"
+          )
             .bind(auth.uid)
             .first();
 
@@ -268,7 +617,9 @@ export default {
           try {
             state = JSON.parse(row.data_json) || {};
           } catch (e) {
-            throw new Error("Dati D1 corrotti o non leggibili.");
+            throw new Error(
+              "Dati D1 corrotti o non leggibili."
+            );
           }
 
           return json({
@@ -281,40 +632,70 @@ export default {
         }
 
         const body = await request.json();
+
         const state = body?.state;
 
         if (!state || typeof state !== "object") {
-          return json({
-            success: false,
-            error: "Payload dati non valido."
-          }, 400);
+          return json(
+            {
+              success: false,
+              error: "Payload dati non valido."
+            },
+            400
+          );
         }
 
         const compact = {
-          cards: Array.isArray(state.cards) ? state.cards : [],
-          trash: Array.isArray(state.trash) ? state.trash : [],
-          customShops: Array.isArray(state.customShops) ? state.customShops : [],
-          favoriteShops: Array.isArray(state.favoriteShops) ? state.favoriteShops : [],
-          cashbackHistory: Array.isArray(state.cashbackHistory) ? state.cashbackHistory : []
+          cards: Array.isArray(state.cards)
+            ? state.cards
+            : [],
+
+          trash: Array.isArray(state.trash)
+            ? state.trash
+            : [],
+
+          customShops: Array.isArray(state.customShops)
+            ? state.customShops
+            : [],
+
+          favoriteShops: Array.isArray(state.favoriteShops)
+            ? state.favoriteShops
+            : [],
+
+          cashbackHistory: Array.isArray(
+            state.cashbackHistory
+          )
+            ? state.cashbackHistory
+            : []
         };
 
         const serialized = JSON.stringify(compact);
 
-        // LIMITE CLOUD PORTATO DA 900 KB A 10 MB
+        /*
+         * D1 può contenere i dati dell'app.
+         * Le immagini, nella prossima fase,
+         * verranno invece spostate in R2.
+         */
         if (serialized.length > 10000000) {
-          return json({
-            success: false,
-            error: "Dati troppo voluminosi per il salvataggio cloud. Limite massimo 10 MB."
-          }, 413);
+          return json(
+            {
+              success: false,
+              error:
+                "Dati troppo voluminosi per il salvataggio cloud. Limite massimo 10 MB."
+            },
+            413
+          );
         }
 
-        const updateResult = await env.DB
-          .prepare("UPDATE users SET data_json=? WHERE uid=?")
+        const updateResult = await env.DB.prepare(
+          "UPDATE users SET data_json=? WHERE uid=?"
+        )
           .bind(serialized, auth.uid)
           .run();
 
-        const verifyRow = await env.DB
-          .prepare("SELECT length(data_json) AS data_bytes FROM users WHERE uid=?")
+        const verifyRow = await env.DB.prepare(
+          "SELECT length(data_json) AS data_bytes FROM users WHERE uid=?"
+        )
           .bind(auth.uid)
           .first();
 
@@ -324,23 +705,31 @@ export default {
           verified: true,
           uid: auth.uid,
           bytes: serialized.length,
-          d1_bytes_after_write: verifyRow?.data_bytes ?? null,
-          changes: updateResult?.meta?.changes ?? null
+          d1_bytes_after_write:
+            verifyRow?.data_bytes ?? null,
+          changes:
+            updateResult?.meta?.changes ?? null
         });
-
       } catch (error) {
-        return json({
-          success: false,
-          error: String(error?.message || error)
-        }, 500);
+        return json(
+          {
+            success: false,
+            error: String(error?.message || error)
+          },
+          500
+        );
       }
     }
 
-    return new Response("GiftWallet API online", {
-      headers: {
-        "Content-Type": "text/plain; charset=UTF-8",
-        "Access-Control-Allow-Origin": "*"
+    return new Response(
+      "GiftWallet API online",
+      {
+        headers: {
+          "Content-Type":
+            "text/plain; charset=UTF-8",
+          "Access-Control-Allow-Origin": "*"
+        }
       }
-    });
+    );
   }
 };
